@@ -1,0 +1,620 @@
+--- linux-source-3.16/drivers/tty/Kconfig.orig	2014-10-09 21:24:04.000000000 +0200
++++ linux-source-3.16/drivers/tty/Kconfig	2014-11-12 18:34:44.127748849 +0100
+@@ -97,6 +97,16 @@
+ 	 information. For framebuffer console users, please refer to
+ 	 <file:Documentation/fb/fbcon.txt>.
+ 
++config VT_VSTATUS
++	bool "Support VSTATUS processing"
++	depends on VT && STACK_TRACER && TASK_XACCT
++	default y
++
++config VT_VSTATUS_NOCHG
++	bool "Reset and printk()-audit STATUS_CHAR() changes"
++	depends on VT_VSTATUS
++	default y
++
+ config UNIX98_PTYS
+ 	bool "Unix98 PTY support" if EXPERT
+ 	default y
+--- linux-source-3.16/drivers/tty/n_tty.c.orig	2015-05-12 10:34:49.000000000 +0200
++++ linux-source-3.16/drivers/tty/n_tty.c	2015-08-28 19:17:48.343895800 +0200
+@@ -51,6 +51,10 @@
+ #include <linux/module.h>
+ #include <linux/ratelimit.h>
+ #include <linux/vmalloc.h>
++#ifdef CONFIG_VT_VSTATUS
++#include <linux/ptrace.h>
++#include <linux/stacktrace.h>
++#endif
+ 
+ 
+ /* number of characters left in xmit buffer before select has we have room */
+@@ -127,6 +131,26 @@
+ 	struct mutex output_lock;
+ };
+ 
++#ifdef CONFIG_VT_VSTATUS
++/*
++ * XXX
++ */
++struct task_struct_racc_deltas {
++	struct list_head list;
++	struct task_struct *task;
++	u64 rchar, rchar_delta;
++	u64 wchar, wchar_delta;
++	cputime_t sutime, sutime_delta;
++};
++
++static struct task_struct_racc_deltas tasklist_racc_deltas = {
++	.list = LIST_HEAD_INIT(tasklist_racc_deltas.list),
++};
++
++static DEFINE_MUTEX(tasklist_racc_deltas_mutex);
++static struct hrtimer tasklist_racc_hr_timer;
++#endif
++
+ static inline size_t read_cnt(struct n_tty_data *ldata)
+ {
+ 	return ldata->read_head - ldata->read_tail;
+@@ -961,6 +985,325 @@
+ 	}
+ }
+ 
++#ifdef CONFIG_VT_VSTATUS
++/**
++ * 	tasklist_racc_release_task -	XXX
++ *	@task: XXX
++ *
++ *
++ *
++ * 	Locking: XXX
++ */
++
++void tasklist_racc_release_task(struct task_struct *task)
++{
++	struct task_struct_racc_deltas *deltas, *tmp;
++
++	mutex_lock(&tasklist_racc_deltas_mutex);
++	list_for_each_entry_safe(deltas, tmp, &tasklist_racc_deltas.list, list) {
++		if (task == deltas->task) {
++			list_del(&deltas->list);
++			break;
++		}
++	}
++	mutex_unlock(&tasklist_racc_deltas_mutex);
++}
++
++/**
++ *	tasklist_racc_hr_callback -	XXX
++ *	@timer: XXX
++ *
++ *
++ *
++ *	Locking: XXX
++ */
++
++static enum hrtimer_restart tasklist_racc_hr_callback(struct hrtimer *timer)
++{
++	ktime_t ktime;
++	struct task_struct *task;
++	enum hrtimer_restart rc;
++	struct task_struct_racc_deltas *deltas;
++
++	read_lock(&tasklist_lock);
++	mutex_lock(&tasklist_racc_deltas_mutex);
++	for_each_process(task) {
++		list_for_each_entry(deltas, &tasklist_racc_deltas.list, list) {
++			if (task != deltas->task)
++				continue;
++
++			get_task_struct(deltas->task);
++			if (likely(deltas->rchar > 0))
++				deltas->rchar_delta = deltas->task->ioac.rchar - deltas->rchar;
++			deltas->rchar = deltas->task->ioac.rchar;
++
++			if (likely(deltas->wchar > 0))
++				deltas->wchar_delta = deltas->task->ioac.wchar - deltas->wchar;
++			deltas->wchar = deltas->task->ioac.wchar;
++
++			if (likely(deltas->sutime > 0))
++				deltas->sutime_delta = (deltas->task->stime + deltas->task->utime) - deltas->sutime;
++			deltas->sutime = deltas->task->stime + deltas->task->utime;
++			put_task_struct(deltas->task);
++		}
++	}
++
++	if (!list_empty(&tasklist_racc_deltas.list)) {
++		ktime = ktime_set(0, 1000 * NSEC_PER_MSEC);
++		hrtimer_forward_now(timer, ktime);
++		rc = HRTIMER_RESTART;
++	} else
++		rc = HRTIMER_NORESTART;
++
++	mutex_unlock(&tasklist_racc_deltas_mutex);
++	read_unlock(&tasklist_lock);
++	return rc;
++}
++
++/**
++ *	process_vstatus_printf	-	process_vstatus() helper function
++ *	@tty: terminal device
++ *	@fmt: the format string
++ *
++ *									XXX
++ *
++ */
++
++static void process_vstatus_printf(struct tty_struct *tty, const char *fmt, ...)
++{
++	va_list ap;
++	unsigned char *p;
++	static unsigned char process_vstatus_printf_buf[128];
++
++	va_start(ap, fmt);
++	 vsnprintf(process_vstatus_printf_buf, sizeof(process_vstatus_printf_buf), fmt, ap);
++	va_end(ap);
++
++	p = process_vstatus_printf_buf;
++	while (*p)
++		echo_char(*p++, tty);
++}
++
++/**
++ *	process_vstatus	-	process VSTATUS				XXX
++ *	@tty: terminal device
++ *
++ * 									XXX
++ *
++ *	Locking: output_lock to protect column state
++ */
++
++static void process_vstatus(struct tty_struct *tty)
++{
++	int err;
++	ktime_t ktime;
++	struct pid *pgrp;
++	struct mm_struct *mm;
++	unsigned int pcpu, state;
++	struct n_tty_data *ldata;
++	struct stack_trace trace;
++	struct task_struct *task;
++	struct timespec uptime_ts;
++	char tcomm[sizeof(task->comm)];
++	struct task_struct_racc_deltas *deltas;
++	unsigned long avnrun[3], *entries, flags;
++	struct timeval rtime_tv, stime_tv, utime_tv;
++
++	ldata = tty->disc_data;
++	mutex_lock(&ldata->output_lock);
++
++	/*
++	 * Force the status line to begin at a new line if not at 0th column.
++	 */
++	if(ldata->column != 0)
++		echo_char_raw('\n', ldata);
++
++	/*
++	 * Print load average during the last minute of system operation.
++	 */
++	get_avenrun(avnrun, FIXED_1 / 200, 0);
++	process_vstatus_printf(tty, "load: %lu.%02lu ",
++#define LOAD_INT(x) ((x) >> FSHIFT)
++#define LOAD_FRAC(x) LOAD_INT(((x) & (FIXED_1-1)) * 100)
++		LOAD_INT(avnrun[0]), LOAD_FRAC(avnrun[0]));
++#undef LOAD_FRAC
++#undef LOAD_INT
++
++	/*
++	 * Short-circuit given no session.
++	 */
++	read_lock(&tasklist_lock);
++	if (tty->session == NULL) {
++		process_vstatus_printf(tty, "not a controlling terminal");
++		goto out;
++	}
++	read_unlock(&tasklist_lock);
++
++	/*
++	 * Obtain and lock process group struct, short-circuiting
++	 * given no foreground or an empty process group.
++	 */
++	spin_lock_irqsave(&tty->ctrl_lock, flags);
++	pgrp = get_pid(tty->pgrp);
++	spin_unlock_irqrestore(&tty->ctrl_lock, flags);
++	if (!pgrp) {
++		process_vstatus_printf(tty, "no foreground process group");
++		put_pid(pgrp);
++		goto out;
++	} else if (hlist_empty(&pgrp->tasks[PIDTYPE_PGID])) {
++		process_vstatus_printf(tty, "empty foreground process group");
++		put_pid(pgrp);
++		goto out;
++	}
++
++	/*
++	 * Obtain and lock the process group leader process task struct.
++	 */
++	read_lock(&tasklist_lock);
++	task = get_pid_task(pgrp, PIDTYPE_PGID);
++	put_pid(pgrp);
++	rcu_read_lock();
++	if (task)
++		get_task_struct(task);
++	rcu_read_unlock();
++	read_unlock(&tasklist_lock);
++	WARN_ON(!task);
++	if (!task)
++		goto out;
++
++	/*
++	 * Copy and print command name and PID.
++	 */	
++	get_task_comm(tcomm, task);
++	process_vstatus_printf(tty, " cmd: %s %d ", tcomm, task->pid);
++
++	/*
++	 * Obtain task state. If the task is not currently blocking, print its
++	 * state. Otherwise, obtain stack trace of depth 1, containing as sole
++	 * element the current stack frame, and print the name of the text symbol
++	 * corresponding to it. Normally, get_wchan() or task_current_syscall()
++	 * would be used here, but both are, at present, broken on x86.
++	 */
++	state = (task->state & TASK_REPORT) | task->exit_state;
++	if (!state)
++		process_vstatus_printf(tty, "[running]");
++	else if (state & __TASK_STOPPED)
++		process_vstatus_printf(tty, "[stopped]");
++	else if (state & __TASK_TRACED)
++		process_vstatus_printf(tty, "[tracing stop]");
++	else if (state & EXIT_ZOMBIE)
++		process_vstatus_printf(tty, "[zombie]");
++	else if ((state & EXIT_DEAD) || (state & TASK_DEAD))
++		process_vstatus_printf(tty, "[dead]");
++	else if (state & TASK_WAKEKILL)
++		process_vstatus_printf(tty, "[wakekill]");
++	else if (state & TASK_WAKING)
++		process_vstatus_printf(tty, "[waking]");
++	else if ((state & TASK_INTERRUPTIBLE) || (state & TASK_UNINTERRUPTIBLE)) {
++		entries = kmalloc(1 * sizeof(*entries), GFP_KERNEL);
++		WARN_ON(!entries);
++		if(!entries)
++			process_vstatus_printf(tty, "[<kmalloc failure>]", entries);
++		else {
++			trace.nr_entries = 0;
++			trace.max_entries = 1;
++			trace.entries = entries;
++			trace.skip = 0;
++
++			err = mutex_lock_killable(&task->signal->cred_guard_mutex);
++			if (err)
++				process_vstatus_printf(tty, "[<%d>]", err);
++			else if (!ptrace_may_access(task, PTRACE_MODE_ATTACH)) {
++				mutex_unlock(&task->signal->cred_guard_mutex);
++				process_vstatus_printf(tty, "[<access denied>]");
++			}
++			if (!err) {
++				save_stack_trace_tsk(task, &trace);
++				process_vstatus_printf(tty, "[%ps]", (void *)entries[0]);
++				mutex_unlock(&task->signal->cred_guard_mutex);
++			}
++			kfree(entries);
++		}
++	}
++
++	/*
++	 * Obtain and print real, user, and system time spent.
++	 */
++	do_posix_clock_monotonic_gettime(&uptime_ts);
++	monotonic_to_bootbased(&uptime_ts);
++	rtime_tv.tv_sec = uptime_ts.tv_sec - task->real_start_time.tv_sec;
++	if ((rtime_tv.tv_usec = (uptime_ts.tv_nsec / 1000)
++			- (task->real_start_time.tv_nsec / 1000)) < 0) {
++		rtime_tv.tv_sec--;
++		rtime_tv.tv_usec += USEC_PER_SEC;
++	}
++	cputime_to_timeval(task->utime, &utime_tv);
++	cputime_to_timeval(task->stime, &stime_tv);
++	process_vstatus_printf(tty, " %ld.%02ldr %ld.%02ldu %ld.%02lds",
++		rtime_tv.tv_sec, rtime_tv.tv_usec / (10 * USEC_PER_MSEC),
++		utime_tv.tv_sec, utime_tv.tv_usec / (10 * USEC_PER_MSEC),
++		stime_tv.tv_sec, stime_tv.tv_usec / (10 * USEC_PER_MSEC));
++
++	/*
++	 * XXX
++	 */
++	mutex_lock(&tasklist_racc_deltas_mutex);
++	list_for_each_entry(deltas, &tasklist_racc_deltas.list, list) {
++		if (deltas->task == task) {
++			if (cputime_to_usecs(deltas->sutime_delta > 0)) {
++				pcpu = (cputime_to_usecs(deltas->sutime_delta) * 100) / (1000 * USEC_PER_MSEC);
++				if (pcpu > 0)
++					process_vstatus_printf(tty, " %u%%", pcpu);
++			}
++
++			if (deltas->rchar_delta > 0)
++				process_vstatus_printf(tty, " %N/s in", deltas->rchar_delta);
++
++			if (deltas->wchar_delta > 0)
++				process_vstatus_printf(tty, " %N/s out", deltas->wchar_delta);
++
++			deltas = NULL;
++			break;
++		}
++	}
++
++	if (deltas && (deltas->task != task)) {
++		deltas = (struct task_struct_racc_deltas *)
++			kzalloc(sizeof(struct task_struct_racc_deltas), GFP_KERNEL);
++		deltas->task = task;
++		deltas->rchar = deltas->task->ioac.rchar;
++		deltas->wchar = deltas->task->ioac.wchar;
++		deltas->sutime = deltas->task->stime + deltas->task->utime;
++		list_add_tail(&deltas->list, &tasklist_racc_deltas.list);
++	}
++	mutex_unlock(&tasklist_racc_deltas_mutex);
++
++	/*
++	 * XXX
++	 */
++	if (!hrtimer_active(&tasklist_racc_hr_timer)) {
++		ktime = ktime_set(0, 1000 * NSEC_PER_MSEC);
++		hrtimer_init(&tasklist_racc_hr_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
++		tasklist_racc_hr_timer.function = tasklist_racc_hr_callback;
++		hrtimer_start(&tasklist_racc_hr_timer, ktime, HRTIMER_MODE_REL);
++	}
++
++	/*
++	 * Obtain and print the resident set size expressed in kilobytes.
++	 */
++	mm = get_task_mm(task);
++	WARN_ON(!mm);
++	process_vstatus_printf(tty, " %ldk", mm ? get_mm_rss(mm) : 0);
++
++	/* Unlock the process group leader process task struct. */
++	put_task_struct(task);
++out:
++	/* Finalise status line */
++	echo_char_raw('\n', ldata);
++	mutex_unlock(&ldata->output_lock);
++}
++#endif
++
+ /**
+  *	finish_erasing		-	complete erase
+  *	@ldata: n_tty data
+@@ -1380,6 +1723,13 @@
+ 				wake_up_interruptible(&tty->read_wait);
+ 			return 0;
+ 		}
++#ifdef CONFIG_VT_VSTATUS
++		if (c == STATUS_CHAR(tty) && L_IEXTEN(tty)) {
++			process_vstatus(tty);
++			commit_echoes(tty);
++			return 0;
++		}
++#endif
+ 	}
+ 
+ 	if (L_ECHO(tty)) {
+@@ -1843,6 +2193,10 @@
+ 				set_bit(WERASE_CHAR(tty), ldata->char_map);
+ 				set_bit(LNEXT_CHAR(tty), ldata->char_map);
+ 				set_bit(EOL2_CHAR(tty), ldata->char_map);
++			#ifdef CONFIG_VT_VSTATUS
++				set_bit(STATUS_CHAR(tty),
++					ldata->char_map);
++			#endif
+ 				if (L_ECHO(tty))
+ 					set_bit(REPRINT_CHAR(tty),
+ 						ldata->char_map);
+--- linux-source-3.16/drivers/tty/tty_ioctl.c.orig	2014-10-09 21:24:04.000000000 +0200
++++ linux-source-3.16/drivers/tty/tty_ioctl.c	2014-11-12 19:17:09.756165100 +0100
+@@ -542,6 +542,9 @@
+ 	struct ktermios old_termios;
+ 	struct tty_ldisc *ld;
+ 	unsigned long flags;
++#if defined(CONFIG_VT_VSTATUS) && defined(CONFIG_VT_VSTATUS_NOCHG)
++	char tcomm[sizeof(current->comm)], parent_tcomm[sizeof(current->comm)];
++#endif
+ 
+ 	/*
+ 	 *	Perform the actual termios internal changes under lock.
+@@ -581,6 +584,22 @@
+ 		}
+ 	}
+ 
++#if defined(CONFIG_VT_VSTATUS) && defined(CONFIG_VT_VSTATUS_NOCHG)
++	/*
++	 *	If the calling process should attempt to change STATUS_CHAR,
++	 *	printk() a diagnostic message and reset it to its original value.
++	 */
++
++	if(old_termios.c_cc[VSTATUS] != STATUS_CHAR(tty)) {
++		get_task_comm(tcomm, current);
++		get_task_comm(parent_tcomm, current->real_parent);
++		printk(KERN_INFO "%s(): process %d/%s (parent %d/%s) tried to set STATUS_CHAR(%s) to 0x%02x, resetting to 0x%02x.\n",
++			__func__, current->pid, tcomm, current->real_parent->pid, parent_tcomm,
++			(tty && tty->name) ? (tty->name) : ("(null)"), STATUS_CHAR(tty), old_termios.c_cc[VSTATUS]);
++		STATUS_CHAR(tty) = old_termios.c_cc[VSTATUS];
++	}
++#endif
++
+ 	if (tty->ops->set_termios)
+ 		(*tty->ops->set_termios)(tty, &old_termios);
+ 	else
+--- linux-source-3.16/include/asm-generic/termios.h.orig	2014-10-09 21:24:04.000000000 +0200
++++ linux-source-3.16/include/asm-generic/termios.h	2014-11-12 19:19:11.282573436 +0100
+@@ -6,5 +6,14 @@
+ #include <uapi/asm-generic/termios.h>
+ 
++#ifdef CONFIG_VT_VSTATUS
++/*	intr=^C		quit=^\		erase=del	kill=^U
++	eof=^D		vtime=\0	vmin=\1		sxtc=\0
++	start=^Q	stop=^S		susp=^Z		eol=\0
++	reprint=^R	discard=^U	werase=^W	lnext=^V
++	eol2=\0		vstatus=^T
++*/
++#define INIT_C_CC "\003\034\177\025\004\0\1\0\021\023\032\0\022\017\027\026\0\024"
++#else
+ /*	intr=^C		quit=^\		erase=del	kill=^U
+ 	eof=^D		vtime=\0	vmin=\1		sxtc=\0
+ 	start=^Q	stop=^S		susp=^Z		eol=\0
+@@ -12,6 +21,7 @@
+ 	eol2=\0
+ */
+ #define INIT_C_CC "\003\034\177\025\004\0\1\0\021\023\032\0\022\017\027\026\0"
++#endif
+ 
+ /*
+  * Translate a "termio" structure into a "termios". Ugh.
+--- linux-source-3.16/include/linux/tty.h.orig	2014-10-09 21:24:04.000000000 +0200
++++ linux-source-3.16/include/linux/tty.h	2014-11-12 19:35:10.178776872 +0100
+@@ -95,6 +95,9 @@
+ #define WERASE_CHAR(tty) ((tty)->termios.c_cc[VWERASE])
+ #define LNEXT_CHAR(tty)	((tty)->termios.c_cc[VLNEXT])
+ #define EOL2_CHAR(tty) ((tty)->termios.c_cc[VEOL2])
++#ifdef CONFIG_VT_VSTATUS
++#define STATUS_CHAR(tty) ((tty)->termios.c_cc[VSTATUS])
++#endif
+
+ #define _I_FLAG(tty, f)	((tty)->termios.c_iflag & (f))
+ #define _O_FLAG(tty, f)	((tty)->termios.c_oflag & (f))
+--- linux-source-3.16/include/uapi/asm-generic/termbits.h.orig	2014-10-09 21:24:04.000000000 +0200
++++ linux-source-3.16/include/uapi/asm-generic/termbits.h	2014-11-12 19:23:13.553385812 +0100
+@@ -57,6 +57,7 @@
+ #define VWERASE 14
+ #define VLNEXT 15
+ #define VEOL2 16
++#define VSTATUS 17
+ 
+ /* c_iflag bits */
+ #define IGNBRK	0000001
+--- linux-source-3.16/kernel/exit.c.orig	2014-10-09 21:24:04.000000000 +0200
++++ linux-source-3.16/kernel/exit.c	2014-11-12 19:24:04.802557385 +0100
+@@ -61,6 +61,10 @@
+ 
+ static void exit_mm(struct task_struct * tsk);
+ 
++#ifdef CONFIG_VT_VSTATUS
++extern void tasklist_racc_release_task(struct task_struct *task);
++#endif
++
+ static void __unhash_process(struct task_struct *p, bool group_dead)
+ {
+ 	nr_threads--;
+@@ -715,6 +719,10 @@
+ 	smp_mb();
+ 	raw_spin_unlock_wait(&tsk->pi_lock);
+ 
++#ifdef CONFIG_VT_VSTATUS
++	tasklist_racc_release_task(tsk);
++#endif
++
+ 	if (unlikely(in_atomic()))
+ 		printk(KERN_INFO "note: %s[%d] exited with preempt_count %d\n",
+ 				current->comm, task_pid_nr(current),
+--- linux-source-3.16/lib/vsprintf.c.orig	2014-10-09 21:24:04.000000000 +0200
++++ linux-source-3.16/lib/vsprintf.c	2014-11-12 19:27:37.525268556 +0100
+@@ -365,7 +365,8 @@
+ 	FORMAT_TYPE_UINT,
+	FORMAT_TYPE_INT,
+ 	FORMAT_TYPE_SIZE_T,
+-	FORMAT_TYPE_PTRDIFF
++	FORMAT_TYPE_PTRDIFF,
++	FORMAT_TYPE_HMNISE
+ };
+ 
+ struct printf_spec {
+@@ -392,5 +392,9 @@
+ 	bool is_zero = num == 0LL;
+ 
++	int unit, unit_idx;
++	static const char units[] = "\0\0kKmMgGtTpP";
++	unsigned long long num_rem;
++
+ 	/* locase = 0 or 0x20. ORing digits or letters with 'locase'
+ 	 * produces same digits or (maybe lowercased) letters */
+ 	locase = (spec.flags & SMALL);
+@@ -419,6 +423,8 @@
+ 
+ 	/* generate full string in tmp[], in reverse order */
+ 	i = 0;
++	unit_idx = 0;
++	num_rem = 0;
+ 	if (num < spec.base)
+ 		tmp[i++] = digits[num] | locase;
+ 	/* Generic code, for any base:
+@@ -437,6 +444,13 @@
+ 			num >>= shift;
+ 		} while (num);
+ 	} else { /* base 10 */
++		if (spec.type == FORMAT_TYPE_HMNISE) {
++			for (unit = 1; (num / unit) >= 1024; unit *= 1024, unit_idx += 2)
++				if (unit_idx >= ((sizeof(units) - 1) / sizeof(units[0])))
++					break;
++			if (unit > 1)
++				num_rem = do_div(num, unit);
++		}
+ 		i = put_dec(tmp, num) - tmp;
+ 	}
+ 
+@@ -492,6 +506,23 @@
+ 			*buf = tmp[i];
+ 		++buf;
+ 	}
++	/* humanised number remnant and postfix */
++	if (spec.type == FORMAT_TYPE_HMNISE) {
++		if (num_rem) {
++			i = put_dec(tmp, num_rem) - tmp;
++			if (i > 2)
++				i = 2;
++			if ((buf + 1 + i) < end) {
++				*buf++ = '.';
++				while (--i >= 0)
++					*buf++ = tmp[i];
++			}
++		}
++		if (unit_idx && (buf < end))
++			*buf++ = locase ? units[unit_idx] : (units[unit_idx + 1]);
++		if (buf < end)
++		*buf++ = locase ? 'b' : 'B';
++	}
+ 	/* trailing space padding */
+ 	while (--spec.field_width >= 0) {
+ 		if (buf < end)
+@@ -1537,6 +1529,10 @@
+ 		return fmt - start;
+ 		/* skip alnum */
+ 
++	case 'N':
++		spec->type = FORMAT_TYPE_HMNISE;
++		return ++fmt - start;
++
+ 	case '%':
+ 		spec->type = FORMAT_TYPE_PERCENT_CHAR;
+ 		return ++fmt - start;
+@@ -1741,6 +1776,23 @@
+ 			++str;
+ 			break;
+ 
++		case FORMAT_TYPE_HMNISE: {
++			u8 qualifier = spec.qualifier;
++
++			if (qualifier == 'L') {
++				num = va_arg(args, unsigned long long);
++			} else if (qualifier == 'l') {
++				num = va_arg(args, unsigned long);
++			} else {
++				num = va_arg(args, unsigned int);
++			}
++
++			spec.base = 10;
++			spec.flags &= ~SIGN;
++			str = number(str, end, num, spec);
++			break;
++		}
++
+ 		default:
+ 			switch (spec.type) {
+ 			case FORMAT_TYPE_LONG_LONG:
