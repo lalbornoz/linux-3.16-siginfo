@@ -1,0 +1,7 @@
+bzImage
+.gdb_history
+linux-source-4.8.0/
+rootfs/
+rootfs.cpio
+scripts
+vmlinux

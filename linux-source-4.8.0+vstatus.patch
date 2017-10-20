@@ -1,5 +1,5 @@
---- linux-source-3.16/drivers/tty/Kconfig.orig	2014-10-09 21:24:04.000000000 +0200
-+++ linux-source-3.16/drivers/tty/Kconfig	2014-11-12 18:34:44.127748849 +0100
+--- linux-source-4.8.0/drivers/tty/Kconfig.orig	2016-10-03 01:24:33.000000000 +0200
++++ linux-source-4.8.0/drivers/tty/Kconfig	2017-10-19 13:45:05.719277064 +0200
 @@ -97,6 +97,16 @@
  	 information. For framebuffer console users, please refer to
  	 <file:Documentation/fb/fbcon.txt>.
@@ -17,20 +17,21 @@
  config UNIX98_PTYS
  	bool "Unix98 PTY support" if EXPERT
  	default y
---- linux-source-3.16/drivers/tty/n_tty.c.orig	2015-05-12 10:34:49.000000000 +0200
-+++ linux-source-3.16/drivers/tty/n_tty.c	2015-08-28 19:17:48.343895800 +0200
-@@ -51,6 +51,10 @@
+--- linux-source-4.8.0/drivers/tty/n_tty.c.orig	2016-10-03 01:24:33.000000000 +0200
++++ linux-source-4.8.0/drivers/tty/n_tty.c	2017-10-19 22:51:05.734167426 +0200
+@@ -51,6 +51,11 @@
  #include <linux/module.h>
  #include <linux/ratelimit.h>
  #include <linux/vmalloc.h>
 +#ifdef CONFIG_VT_VSTATUS
 +#include <linux/ptrace.h>
 +#include <linux/stacktrace.h>
++#include <linux/timekeeping.h>
 +#endif
  
  
  /* number of characters left in xmit buffer before select has we have room */
-@@ -127,6 +131,26 @@
+@@ -126,6 +131,26 @@
  	struct mutex output_lock;
  };
  
@@ -57,7 +58,7 @@
  static inline size_t read_cnt(struct n_tty_data *ldata)
  {
  	return ldata->read_head - ldata->read_tail;
-@@ -961,6 +985,325 @@
+@@ -920,6 +945,337 @@
  	}
  }
  
@@ -179,10 +180,11 @@
 +	struct n_tty_data *ldata;
 +	struct stack_trace trace;
 +	struct task_struct *task;
-+	struct timespec uptime_ts;
 +	char tcomm[sizeof(task->comm)];
 +	struct task_struct_racc_deltas *deltas;
 +	unsigned long avnrun[3], *entries, flags;
++	struct timespec uptime_ts;
++	u64 uptime_ns, rtime_delta_ns;
 +	struct timeval rtime_tv, stime_tv, utime_tv;
 +
 +	ldata = tty->disc_data;
@@ -289,7 +291,7 @@
 +			err = mutex_lock_killable(&task->signal->cred_guard_mutex);
 +			if (err)
 +				process_vstatus_printf(tty, "[<%d>]", err);
-+			else if (!ptrace_may_access(task, PTRACE_MODE_ATTACH)) {
++			else if (!ptrace_may_access(task, PTRACE_MODE_ATTACH|PTRACE_MODE_REALCREDS)) {
 +				mutex_unlock(&task->signal->cred_guard_mutex);
 +				process_vstatus_printf(tty, "[<access denied>]");
 +			}
@@ -305,16 +307,25 @@
 +	/*
 +	 * Obtain and print real, user, and system time spent.
 +	 */
-+	do_posix_clock_monotonic_gettime(&uptime_ts);
-+	monotonic_to_bootbased(&uptime_ts);
-+	rtime_tv.tv_sec = uptime_ts.tv_sec - task->real_start_time.tv_sec;
-+	if ((rtime_tv.tv_usec = (uptime_ts.tv_nsec / 1000)
-+			- (task->real_start_time.tv_nsec / 1000)) < 0) {
-+		rtime_tv.tv_sec--;
-+		rtime_tv.tv_usec += USEC_PER_SEC;
++	ktime_get_ts(&uptime_ts);
++	uptime_ns = (uptime_ts.tv_sec * NSEC_PER_SEC) + uptime_ts.tv_nsec;
++	rtime_delta_ns = uptime_ns - task->start_time;
++	if (likely(rtime_delta_ns)) {
++		rtime_tv.tv_sec = rtime_delta_ns / NSEC_PER_SEC;
++		rtime_tv.tv_usec = rtime_delta_ns % NSEC_PER_SEC;
++	} else {
++		rtime_tv = ns_to_timeval(0);
 +	}
-+	cputime_to_timeval(task->utime, &utime_tv);
-+	cputime_to_timeval(task->stime, &stime_tv);
++	if (likely(task->utime)) {
++		cputime_to_timeval(task->utime, &utime_tv);
++	} else {
++		utime_tv = ns_to_timeval(0);
++	}
++	if (likely(task->stime)) {
++		cputime_to_timeval(task->stime, &stime_tv);
++	} else {
++		stime_tv = ns_to_timeval(0);
++	}
 +	process_vstatus_printf(tty, " %ld.%02ldr %ld.%02ldu %ld.%02lds",
 +		rtime_tv.tv_sec, rtime_tv.tv_usec / (10 * USEC_PER_MSEC),
 +		utime_tv.tv_sec, utime_tv.tv_usec / (10 * USEC_PER_MSEC),
@@ -357,9 +368,11 @@
 +	/*
 +	 * XXX
 +	 */
++	if (!tasklist_racc_hr_timer.base) {
++		hrtimer_init(&tasklist_racc_hr_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
++	}
 +	if (!hrtimer_active(&tasklist_racc_hr_timer)) {
 +		ktime = ktime_set(0, 1000 * NSEC_PER_MSEC);
-+		hrtimer_init(&tasklist_racc_hr_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 +		tasklist_racc_hr_timer.function = tasklist_racc_hr_callback;
 +		hrtimer_start(&tasklist_racc_hr_timer, ktime, HRTIMER_MODE_REL);
 +	}
@@ -383,8 +396,8 @@
  /**
   *	finish_erasing		-	complete erase
   *	@ldata: n_tty data
-@@ -1380,6 +1723,13 @@
- 				wake_up_interruptible(&tty->read_wait);
+@@ -1349,6 +1705,13 @@
+ 			wake_up_interruptible_poll(&tty->read_wait, POLLIN);
  			return 0;
  		}
 +#ifdef CONFIG_VT_VSTATUS
@@ -397,7 +410,7 @@
  	}
  
  	if (L_ECHO(tty)) {
-@@ -1843,6 +2193,10 @@
+@@ -1804,6 +2167,10 @@
  				set_bit(WERASE_CHAR(tty), ldata->char_map);
  				set_bit(LNEXT_CHAR(tty), ldata->char_map);
  				set_bit(EOL2_CHAR(tty), ldata->char_map);
@@ -408,21 +421,21 @@
  				if (L_ECHO(tty))
  					set_bit(REPRINT_CHAR(tty),
  						ldata->char_map);
---- linux-source-3.16/drivers/tty/tty_ioctl.c.orig	2014-10-09 21:24:04.000000000 +0200
-+++ linux-source-3.16/drivers/tty/tty_ioctl.c	2014-11-12 19:17:09.756165100 +0100
-@@ -542,6 +542,9 @@
+--- linux-source-4.8.0/drivers/tty/tty_ioctl.c.orig	2016-10-03 01:24:33.000000000 +0200
++++ linux-source-4.8.0/drivers/tty/tty_ioctl.c	2017-10-19 13:49:24.604344548 +0200
+@@ -536,6 +536,9 @@
+ {
  	struct ktermios old_termios;
  	struct tty_ldisc *ld;
- 	unsigned long flags;
 +#if defined(CONFIG_VT_VSTATUS) && defined(CONFIG_VT_VSTATUS_NOCHG)
 +	char tcomm[sizeof(current->comm)], parent_tcomm[sizeof(current->comm)];
 +#endif
  
- 	/*
- 	 *	Perform the actual termios internal changes under lock.
-@@ -581,6 +584,22 @@
- 		}
- 	}
+ 	WARN_ON(tty->driver->type == TTY_DRIVER_TYPE_PTY &&
+ 		tty->driver->subtype == PTY_TYPE_MASTER);
+@@ -551,6 +554,22 @@
+ 	tty->termios = *new_termios;
+ 	unset_locked_termios(tty, &old_termios);
  
 +#if defined(CONFIG_VT_VSTATUS) && defined(CONFIG_VT_VSTATUS_NOCHG)
 +	/*
@@ -441,11 +454,12 @@
 +#endif
 +
  	if (tty->ops->set_termios)
- 		(*tty->ops->set_termios)(tty, &old_termios);
+ 		tty->ops->set_termios(tty, &old_termios);
  	else
---- linux-source-3.16/include/asm-generic/termios.h.orig	2014-10-09 21:24:04.000000000 +0200
-+++ linux-source-3.16/include/asm-generic/termios.h	2014-11-12 19:19:11.282573436 +0100
-@@ -6,5 +6,14 @@
+--- linux-source-4.8.0/include/asm-generic/termios.h.orig	2016-10-03 01:24:33.000000000 +0200
++++ linux-source-4.8.0/include/asm-generic/termios.h	2017-10-19 13:49:55.892475805 +0200
+@@ -5,6 +5,15 @@
+ #include <asm/uaccess.h>
  #include <uapi/asm-generic/termios.h>
  
 +#ifdef CONFIG_VT_VSTATUS
@@ -468,20 +482,20 @@
  
  /*
   * Translate a "termio" structure into a "termios". Ugh.
---- linux-source-3.16/include/linux/tty.h.orig	2014-10-09 21:24:04.000000000 +0200
-+++ linux-source-3.16/include/linux/tty.h	2014-11-12 19:35:10.178776872 +0100
-@@ -95,6 +95,9 @@
+--- linux-source-4.8.0/include/linux/tty.h.orig	2016-10-03 01:24:33.000000000 +0200
++++ linux-source-4.8.0/include/linux/tty.h	2017-10-19 13:50:08.480528724 +0200
+@@ -118,6 +118,9 @@
  #define WERASE_CHAR(tty) ((tty)->termios.c_cc[VWERASE])
  #define LNEXT_CHAR(tty)	((tty)->termios.c_cc[VLNEXT])
  #define EOL2_CHAR(tty) ((tty)->termios.c_cc[VEOL2])
 +#ifdef CONFIG_VT_VSTATUS
 +#define STATUS_CHAR(tty) ((tty)->termios.c_cc[VSTATUS])
 +#endif
-
+ 
  #define _I_FLAG(tty, f)	((tty)->termios.c_iflag & (f))
  #define _O_FLAG(tty, f)	((tty)->termios.c_oflag & (f))
---- linux-source-3.16/include/uapi/asm-generic/termbits.h.orig	2014-10-09 21:24:04.000000000 +0200
-+++ linux-source-3.16/include/uapi/asm-generic/termbits.h	2014-11-12 19:23:13.553385812 +0100
+--- linux-source-4.8.0/include/uapi/asm-generic/termbits.h.orig	2016-10-03 01:24:33.000000000 +0200
++++ linux-source-4.8.0/include/uapi/asm-generic/termbits.h	2017-10-19 13:50:33.536634239 +0200
 @@ -57,6 +57,7 @@
  #define VWERASE 14
  #define VLNEXT 15
@@ -490,11 +504,11 @@
  
  /* c_iflag bits */
  #define IGNBRK	0000001
---- linux-source-3.16/kernel/exit.c.orig	2014-10-09 21:24:04.000000000 +0200
-+++ linux-source-3.16/kernel/exit.c	2014-11-12 19:24:04.802557385 +0100
-@@ -61,6 +61,10 @@
- 
- static void exit_mm(struct task_struct * tsk);
+--- linux-source-4.8.0/kernel/exit.c.orig	2016-10-03 01:24:33.000000000 +0200
++++ linux-source-4.8.0/kernel/exit.c	2017-10-19 13:51:15.800812741 +0200
+@@ -60,6 +60,10 @@
+ #include <asm/pgtable.h>
+ #include <asm/mmu_context.h>
  
 +#ifdef CONFIG_VT_VSTATUS
 +extern void tasklist_racc_release_task(struct task_struct *task);
@@ -503,22 +517,22 @@
  static void __unhash_process(struct task_struct *p, bool group_dead)
  {
  	nr_threads--;
-@@ -715,6 +719,10 @@
- 	smp_mb();
+@@ -786,6 +790,10 @@
+ 	 */
  	raw_spin_unlock_wait(&tsk->pi_lock);
  
 +#ifdef CONFIG_VT_VSTATUS
 +	tasklist_racc_release_task(tsk);
 +#endif
 +
- 	if (unlikely(in_atomic()))
- 		printk(KERN_INFO "note: %s[%d] exited with preempt_count %d\n",
- 				current->comm, task_pid_nr(current),
---- linux-source-3.16/lib/vsprintf.c.orig	2014-10-09 21:24:04.000000000 +0200
-+++ linux-source-3.16/lib/vsprintf.c	2014-11-12 19:27:37.525268556 +0100
-@@ -365,7 +365,8 @@
+ 	if (unlikely(in_atomic())) {
+ 		pr_info("note: %s[%d] exited with preempt_count %d\n",
+ 			current->comm, task_pid_nr(current),
+--- linux-source-4.8.0/lib/vsprintf.c.orig	2016-10-03 01:24:33.000000000 +0200
++++ linux-source-4.8.0/lib/vsprintf.c	2017-10-19 15:22:53.004092950 +0200
+@@ -382,7 +382,8 @@
  	FORMAT_TYPE_UINT,
-	FORMAT_TYPE_INT,
+ 	FORMAT_TYPE_INT,
  	FORMAT_TYPE_SIZE_T,
 -	FORMAT_TYPE_PTRDIFF
 +	FORMAT_TYPE_PTRDIFF,
@@ -526,26 +540,26 @@
  };
  
  struct printf_spec {
-@@ -392,5 +392,9 @@
+@@ -408,6 +409,9 @@
  	bool is_zero = num == 0LL;
- 
+ 	int field_width = spec.field_width;
+ 	int precision = spec.precision;
 +	int unit, unit_idx;
 +	static const char units[] = "\0\0kKmMgGtTpP";
 +	unsigned long long num_rem;
-+
- 	/* locase = 0 or 0x20. ORing digits or letters with 'locase'
- 	 * produces same digits or (maybe lowercased) letters */
- 	locase = (spec.flags & SMALL);
-@@ -419,6 +423,8 @@
+ 
+ 	BUILD_BUG_ON(sizeof(struct printf_spec) != 8);
+ 
+@@ -439,6 +443,8 @@
  
  	/* generate full string in tmp[], in reverse order */
  	i = 0;
 +	unit_idx = 0;
 +	num_rem = 0;
  	if (num < spec.base)
- 		tmp[i++] = digits[num] | locase;
- 	/* Generic code, for any base:
-@@ -437,6 +444,13 @@
+ 		tmp[i++] = hex_asc_upper[num] | locase;
+ 	else if (spec.base != 10) { /* 8 or 16 */
+@@ -452,6 +458,13 @@
  			num >>= shift;
  		} while (num);
  	} else { /* base 10 */
@@ -559,7 +573,7 @@
  		i = put_dec(tmp, num) - tmp;
  	}
  
-@@ -492,6 +506,23 @@
+@@ -508,6 +521,23 @@
  			*buf = tmp[i];
  		++buf;
  	}
@@ -581,11 +595,11 @@
 +		*buf++ = locase ? 'b' : 'B';
 +	}
  	/* trailing space padding */
- 	while (--spec.field_width >= 0) {
+ 	while (--field_width >= 0) {
  		if (buf < end)
-@@ -1537,6 +1529,10 @@
- 		return fmt - start;
- 		/* skip alnum */
+@@ -1866,6 +1896,10 @@
+ 		spec->type = FORMAT_TYPE_PTR;
+ 		return ++fmt - start;
  
 +	case 'N':
 +		spec->type = FORMAT_TYPE_HMNISE;
@@ -594,27 +608,18 @@
  	case '%':
  		spec->type = FORMAT_TYPE_PERCENT_CHAR;
  		return ++fmt - start;
-@@ -1741,6 +1776,23 @@
+@@ -2057,6 +2091,14 @@
  			++str;
  			break;
  
 +		case FORMAT_TYPE_HMNISE: {
-+			u8 qualifier = spec.qualifier;
-+
-+			if (qualifier == 'L') {
-+				num = va_arg(args, unsigned long long);
-+			} else if (qualifier == 'l') {
-+				num = va_arg(args, unsigned long);
-+			} else {
-+				num = va_arg(args, unsigned int);
-+			}
-+
++			num = va_arg(args, unsigned long);
 +			spec.base = 10;
 +			spec.flags &= ~SIGN;
 +			str = number(str, end, num, spec);
 +			break;
 +		}
 +
- 		default:
- 			switch (spec.type) {
- 			case FORMAT_TYPE_LONG_LONG:
+ 		case FORMAT_TYPE_INVALID:
+ 			/*
+ 			 * Presumably the arguments passed gcc's type
